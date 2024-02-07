@@ -129,6 +129,10 @@ def cosmx(
     )
     adata.var_names = counts.columns
 
+    # Filter out single-cell FOVs since we cannot define a transform to global from a single cell
+    num_cells = adata.obs[['fov']].groupby('fov').size()
+    adata = adata[adata.obs['fov'].isin(num_cells[num_cells > 2].index)]
+
     table = TableModel.parse(
         adata,
         region=list(set(adata.obs[CosmxKeys.REGION_KEY].astype(str).tolist())),
