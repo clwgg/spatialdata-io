@@ -40,11 +40,11 @@ class CosmxKeys(ModeEnum):
     """Keys for *Nanostring Cosmx* formatted dataset."""
 
     # files and directories
-    COUNTS_SUFFIX = "exprMat_file.csv"
-    TRANSCRIPTS_SUFFIX = "tx_file.csv"
-    METADATA_SUFFIX = "metadata_file.csv"
-    FOV_SUFFIX = "fov_positions_file.csv"
     IMAGES_DIR = "CellComposite"
+    COUNTS_SUFFIX = "exprMat_file"
+    TRANSCRIPTS_SUFFIX = "tx_file"
+    METADATA_SUFFIX = "metadata_file"
+    FOV_SUFFIX = "fov_positions_file"
     LABELS_DIR = "CellLabels"
     # metadata
     FOV = "fov"
