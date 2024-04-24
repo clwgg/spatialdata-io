@@ -59,6 +59,20 @@ def _get_csv_name(path):
             path = None
     return path
 
+def _get_tx_dtypes():
+    return {
+        'fov': 'int64',
+        'cell_ID': 'int64',
+        'cell': 'O',
+        'x_local_px': 'float64',
+        'y_local_px': 'float64',
+        'x_global_px': 'float64',
+        'y_global_px': 'float64',
+        'z': 'int64',
+        'target': 'O',
+        'CellComp': 'O',
+    }
+
 
 @inject_docs(cx=CosmxKeys)
 def cosmx(
@@ -277,37 +291,16 @@ def cosmx(
 
     points: dict[str, DaskDataFrame] = {}
     if transcripts:
-        # assert transcripts_file is not None
-        # from pyarrow.csv import read_csv
-        #
-        # ptable = read_csv(path / transcripts_file)  # , header=0)
-        # for fov in fovs_counts:
-        #     aff = affine_transforms_to_global[fov]
-        #     sub_table = ptable.filter(pa.compute.equal(ptable.column(CosmxKeys.FOV), int(fov))).to_pandas()
-        #     sub_table[CosmxKeys.INSTANCE_KEY] = sub_table[CosmxKeys.INSTANCE_KEY].astype("category")
-        #     # we rename z because we want to treat the data as 2d
-        #     sub_table.rename(columns={"z": "z_raw"}, inplace=True)
-        #     points[fov] = PointsModel.parse(
-        #         sub_table,
-        #         coordinates={"x": CosmxKeys.X_LOCAL_TRANSCRIPT, "y": CosmxKeys.Y_LOCAL_TRANSCRIPT},
-        #         feature_key=CosmxKeys.TARGET_OF_TRANSCRIPT,
-        #         instance_key=CosmxKeys.INSTANCE_KEY,
-        #         transformations={
-        #             fov: Identity(),
-        #             "global": aff,
-        #             "global_only_labels": aff,
-        #         },
-        #     )
-        # let's convert the .csv to .parquet and let's read it with pyarrow.parquet for faster subsetting
+        # convert the .csv to .parquet and read it with pyarrow.parquet for faster subsetting
         import tempfile
-
+        from dask.dataframe import read_csv
         import pyarrow.parquet as pq
 
         with tempfile.TemporaryDirectory() as tmpdir:
             print("converting .csv to .parquet to improve the speed of the slicing operations... ", end="")
             assert transcripts_file is not None
-            transcripts_data = pd.read_csv(path / transcripts_file, header=0)
-            transcripts_data.to_parquet(Path(tmpdir) / "transcripts.parquet")
+            transcripts_data = read_csv(path / transcripts_file, header=0, dtype=_get_tx_dtypes())
+            transcripts_data.to_parquet(Path(tmpdir) / "transcripts.parquet", write_index=False)
             print("done")
 
             ptable = pq.read_table(Path(tmpdir) / "transcripts.parquet")
@@ -317,6 +310,9 @@ def cosmx(
                 sub_table[CosmxKeys.INSTANCE_KEY] = sub_table[CosmxKeys.INSTANCE_KEY].astype("category")
                 # we rename z because we want to treat the data as 2d
                 sub_table.rename(columns={"z": "z_raw"}, inplace=True)
+                if "CellComp" in sub_table:
+                    sub_table['CellComp'] = sub_table['CellComp'].fillna('0').astype("category")
+
                 if len(sub_table) > 0:
                     points[f"{fov}_points"] = PointsModel.parse(
                         sub_table,
