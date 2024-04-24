@@ -27,6 +27,23 @@ from spatialdata_io._docs import inject_docs
 __all__ = ["cosmx"]
 
 
+def _infer_flip_y(obs):
+    """
+    infer if images/labels need to be flipped to match points (early data) or not (later data)
+    """
+    y_coord_corr = (
+        obs[['fov', 'CenterY_local_px', 'CenterY_global_px']]
+        .groupby('fov').corr().reset_index()
+        .query('level_1 == "CenterY_local_px"')[['fov', 'CenterY_global_px']]
+        .reset_index(drop=True).rename(columns={'CenterY_global_px': 'y_corr'})
+    )
+    if y_coord_corr.y_corr.mean() < 0:
+        flip_y = False
+    else:
+        flip_y = True
+    return flip_y
+
+
 @inject_docs(cx=CosmxKeys)
 def cosmx(
     path: str | Path,
@@ -112,6 +129,8 @@ def cosmx(
     obs.rename_axis(None, inplace=True)
     obs.index = obs.index.astype(str).str.cat(obs[CosmxKeys.FOV].values, sep="_")
 
+    flip_y = _infer_flip_y(obs)
+
     common_index = obs.index.intersection(counts.index)
 
     adata = AnnData(
@@ -121,7 +140,7 @@ def cosmx(
     )
     adata.var_names = counts.columns
 
-    # Filter out single-cell FOVs since we cannot define a transform to global from a single cell
+    # Filter out one-cell FOVs since we cannot define a transform to global from a single cell
     num_cells = adata.obs[['fov']].groupby('fov').size()
     adata = adata[adata.obs['fov'].isin(num_cells[num_cells > 2].index)]
 
@@ -187,9 +206,12 @@ def cosmx(
             if fov in fovs_counts:
                 aff = affine_transforms_to_global[fov]
                 im = imread(path / CosmxKeys.IMAGES_DIR / fname, **imread_kwargs).squeeze()
-                flipped_im = da.flip(im, axis=0)
+                if flip_y:
+                    matched_im = da.flip(im, axis=0)
+                else:
+                    matched_im = im
                 parsed_im = Image2DModel.parse(
-                    flipped_im,
+                    matched_im,
                     transformations={
                         fov: Identity(),
                         "global": aff,
@@ -211,9 +233,12 @@ def cosmx(
             if fov in fovs_counts:
                 aff = affine_transforms_to_global[fov]
                 la = imread(path / CosmxKeys.LABELS_DIR / fname, **imread_kwargs).squeeze()
-                flipped_la = da.flip(la, axis=0)
+                if flip_y:
+                    matched_la = da.flip(la, axis=0)
+                else:
+                    matched_la = la
                 parsed_la = Labels2DModel.parse(
-                    flipped_la,
+                    matched_la,
                     transformations={
                         fov: Identity(),
                         "global": aff,
