@@ -51,6 +51,14 @@ def _infer_flip_y(obs):
         flip_y = True
     return flip_y
 
+def _get_csv_name(path):
+    path = path.with_suffix(".csv")
+    if not path.exists():
+        path = path.with_suffix(".csv.gz")
+        if not path.exists():
+            path = None
+    return path
+
 
 @inject_docs(cx=CosmxKeys)
 def cosmx(
@@ -105,20 +113,20 @@ def cosmx(
         raise ValueError("Could not infer `dataset_id` from the name of the counts file. Please specify it manually.")
 
     # check for file existence
-    counts_file = path / f"{dataset_id}_{CosmxKeys.COUNTS_SUFFIX}"
-    if not counts_file.exists():
+    counts_file = _get_csv_name(path / f"{dataset_id}_{CosmxKeys.COUNTS_SUFFIX}")
+    if not counts_file:
         raise FileNotFoundError(f"Counts file not found: {counts_file}.")
     if transcripts:
-        transcripts_file = path / f"{dataset_id}_{CosmxKeys.TRANSCRIPTS_SUFFIX}"
-        if not transcripts_file.exists():
+        transcripts_file = _get_csv_name(path / f"{dataset_id}_{CosmxKeys.TRANSCRIPTS_SUFFIX}")
+        if not transcripts_file:
             raise FileNotFoundError(f"Transcripts file not found: {transcripts_file}.")
     else:
         transcripts_file = None
-    meta_file = path / f"{dataset_id}_{CosmxKeys.METADATA_SUFFIX}"
-    if not meta_file.exists():
+    meta_file = _get_csv_name(path / f"{dataset_id}_{CosmxKeys.METADATA_SUFFIX}")
+    if not meta_file:
         raise FileNotFoundError(f"Metadata file not found: {meta_file}.")
-    fov_file = path / f"{dataset_id}_{CosmxKeys.FOV_SUFFIX}"
-    if not fov_file.exists():
+    fov_file = _get_csv_name(path / f"{dataset_id}_{CosmxKeys.FOV_SUFFIX}")
+    if not fov_file:
         raise FileNotFoundError(f"Found field of view file: {fov_file}.")
     images_dir = path / CosmxKeys.IMAGES_DIR
     if not images_dir.exists():
