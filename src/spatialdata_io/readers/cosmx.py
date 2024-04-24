@@ -192,6 +192,7 @@ def cosmx(
 
     # prepare to read images and labels
     file_extensions = (".jpg", ".png", ".jpeg", ".tif", ".tiff")
+    file_extensions += tuple(ext.upper() for ext in file_extensions)
     pat = re.compile(r".*_F(\d+)")
 
     # check if fovs are correct for images and labels
@@ -214,6 +215,12 @@ def cosmx(
             + "... will use only fovs in Table."
         )
 
+
+    channels = [c.replace("Max.", "") for c in
+                table.obs.columns[table.obs.columns.str.startswith("Max.")]]
+    channels = [re.sub("^Membrane.*$", "Membrane", c) for c in channels]
+    assert len(channels) == 5
+
     # read images
     images = {}
     for fname in os.listdir(path / CosmxKeys.IMAGES_DIR):
@@ -223,7 +230,7 @@ def cosmx(
                 aff = affine_transforms_to_global[fov]
                 im = imread(path / CosmxKeys.IMAGES_DIR / fname, **imread_kwargs).squeeze()
                 if flip_y:
-                    matched_im = da.flip(im, axis=0)
+                    matched_im = da.flip(im, axis=1)
                 else:
                     matched_im = im
                 parsed_im = Image2DModel.parse(
@@ -233,7 +240,8 @@ def cosmx(
                         "global": aff,
                         "global_only_image": aff,
                     },
-                    dims=("y", "x", "c"),
+                    dims=("c", "y", "x"),
+                    c_coords=channels,
                     rgb=None,
                     **image_models_kwargs,
                 )
