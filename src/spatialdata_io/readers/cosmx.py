@@ -153,6 +153,10 @@ def cosmx(
 
     flip_y = _infer_flip_y(obs)
 
+    # Drop the `cell_id` column because it throws an error given the presence of the `cell_ID` column.
+    # Also: `cell_id` is redundant with `cell`
+    obs.drop(columns="cell_id", inplace=True)
+
     common_index = obs.index.intersection(counts.index)
 
     adata = AnnData(
