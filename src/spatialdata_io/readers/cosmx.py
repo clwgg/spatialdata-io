@@ -33,7 +33,7 @@ def _infer_flip_y(obs):
     """
     y_coord_corr = (
         obs[['fov', 'CenterY_local_px', 'CenterY_global_px']]
-        .groupby('fov').corr().reset_index()
+        .groupby('fov', observed=False).corr().reset_index()
         .query('level_1 == "CenterY_local_px"')[['fov', 'CenterY_global_px']]
         .reset_index(drop=True).rename(columns={'CenterY_global_px': 'y_corr'})
     )
@@ -161,14 +161,13 @@ def cosmx(
 
     adata = AnnData(
         csr_matrix(counts.loc[common_index, :].values),
-        dtype=counts.values.dtype,
         obs=obs.loc[common_index, :],
     )
     adata.var_names = counts.columns
 
     # Filter out one-cell FOVs since we cannot define a transform to global from a single cell
-    num_cells = adata.obs[['fov']].groupby('fov').size()
-    adata = adata[adata.obs['fov'].isin(num_cells[num_cells > 2].index)]
+    num_cells = adata.obs[['fov']].groupby('fov', observed=False).size()
+    adata = adata[adata.obs['fov'].isin(num_cells[num_cells > 2].index)].copy()
 
     table = TableModel.parse(
         adata,
