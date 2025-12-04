@@ -228,7 +228,19 @@ def cosmx(
     channels = [c.replace("Max.", "") for c in
                 table.obs.columns[table.obs.columns.str.startswith("Max.")]]
     channels = [re.sub("^Membrane.*$", "Membrane", c) for c in channels]
-    assert len(channels) == 5
+    original_channels = channels.copy()
+    if len(channels) < 5:
+        raise ValueError(f"Need at least 5 channels. Found only {len(channels)}: {channels}")
+    elif len(channels) > 5:
+        logger.warning(
+            f"(TRUNCATED) More than 5 channels detected; truncating channels from {original_channels} "
+            f"to {channels[:5]}."
+        )
+        channels = channels[:5]
+    else:
+        logger.warning(
+            f"Found exactly 5 channels: {channels}"
+        )
 
     # read images
     images = {}
