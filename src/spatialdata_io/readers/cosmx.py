@@ -14,7 +14,7 @@ import pyarrow as pa
 from anndata import AnnData
 from dask.dataframe import DataFrame as DaskDataFrame
 from dask_image.imread import imread
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, vstack as sparse_vstack
 from skimage.transform import estimate_transform
 from spatialdata import SpatialData
 from spatialdata._logging import logger
@@ -141,9 +141,7 @@ def cosmx(
     if not labels_dir.exists():
         raise FileNotFoundError(f"Labels directory not found: {labels_dir}.")
 
-    counts = pd.read_csv(path / counts_file, header=0, index_col=CosmxKeys.INSTANCE_KEY)
-    counts.index = counts.index.astype(str).str.cat(counts.pop(CosmxKeys.FOV).astype(str).values, sep="_")
-
+    # Read obs first (typically smaller than counts)
     obs = pd.read_csv(path / meta_file, header=0, index_col=CosmxKeys.INSTANCE_KEY)
     obs[CosmxKeys.FOV] = pd.Categorical(obs[CosmxKeys.FOV].astype(str))
     obs[CosmxKeys.REGION_KEY] = pd.Categorical(obs[CosmxKeys.FOV].astype(str).apply(lambda s: s + "_labels"))
@@ -157,13 +155,82 @@ def cosmx(
     # Also: `cell_id` is redundant with `cell`
     obs.drop(columns="cell_id", inplace=True)
 
-    common_index = obs.index.intersection(counts.index)
+    # Read only index and FOV columns to build counts index without loading full data
+    # This is memory-efficient for large files
+    logger.info("Reading counts file index to determine row mapping...")
+    counts_index_df = pd.read_csv(
+        path / counts_file,
+        header=0,
+        usecols=[CosmxKeys.INSTANCE_KEY, CosmxKeys.FOV],
+        dtype={CosmxKeys.INSTANCE_KEY: str, CosmxKeys.FOV: str},
+    )
+    counts_index = (
+        counts_index_df[CosmxKeys.INSTANCE_KEY].astype(str)
+        .str.cat(counts_index_df[CosmxKeys.FOV].astype(str).values, sep="_")
+    )
+    del counts_index_df  # Free memory
+
+    # Get column names and compute common_index
+    counts_header = pd.read_csv(path / counts_file, header=0, nrows=0)
+    counts_columns = [col for col in counts_header.columns if col not in [CosmxKeys.INSTANCE_KEY, CosmxKeys.FOV]]
+    common_index = obs.index.intersection(counts_index)
+    common_index_set = set(common_index)  # For faster lookup
+    del counts_header  # Free memory
+
+    # Read counts data in chunks and convert to sparse immediately
+    # This avoids loading the entire dense DataFrame into memory
+    logger.info(f"Reading counts data in chunks (found {len(common_index)} common cells)...")
+    chunk_size = 50000  # Process 50k rows at a time
+    
+    # Create a mapping from modified index to position in common_index for proper ordering
+    common_index_map = {idx: i for i, idx in enumerate(common_index)}
+    
+    # Store sparse data with their target positions
+    sparse_data_list = []  # List of (sparse_matrix, position_array)
+    
+    # Read in chunks using pandas chunked reading
+    counts_reader = pd.read_csv(
+        path / counts_file,
+        header=0,
+        index_col=CosmxKeys.INSTANCE_KEY,
+        chunksize=chunk_size,
+    )
+    
+    for chunk_df in counts_reader:
+        # Modify index same way as before
+        chunk_df.index = chunk_df.index.astype(str).str.cat(
+            chunk_df.pop(CosmxKeys.FOV).astype(str).values, sep="_"
+        )
+        # Filter to common_index
+        chunk_mask = chunk_df.index.isin(common_index_set)
+        if chunk_mask.any():
+            chunk_filtered = chunk_df.loc[chunk_mask, counts_columns]
+            # Convert to sparse immediately to save memory
+            sparse_chunk = csr_matrix(chunk_filtered.values)
+            # Get positions in common_index for this chunk
+            chunk_indices = chunk_filtered.index
+            chunk_positions = np.array([common_index_map[idx] for idx in chunk_indices])
+            sparse_data_list.append((sparse_chunk, chunk_positions))
+        del chunk_df  # Free memory
+
+    # Build final sparse matrix in correct order
+    if sparse_data_list:
+        # Combine all sparse matrices
+        all_sparse = sparse_vstack([data[0] for data in sparse_data_list], format="csr")
+        all_positions = np.concatenate([data[1] for data in sparse_data_list])
+        
+        # Reorder to match common_index order
+        reorder_idx = np.argsort(all_positions)
+        counts_sparse = all_sparse[reorder_idx]
+    else:
+        # Edge case: no matching rows
+        counts_sparse = csr_matrix((len(common_index), len(counts_columns)))
 
     adata = AnnData(
-        csr_matrix(counts.loc[common_index, :].values),
+        counts_sparse,
         obs=obs.loc[common_index, :],
     )
-    adata.var_names = counts.columns
+    adata.var_names = counts_columns
 
     # Filter out one-cell FOVs since we cannot define a transform to global from a single cell
     num_cells = adata.obs[['fov']].groupby('fov', observed=False).size()
@@ -299,39 +366,74 @@ def cosmx(
     points: dict[str, DaskDataFrame] = {}
     if transcripts:
         # convert the .csv to .parquet and read it with pyarrow.parquet for faster subsetting
+        # Use pandas chunked reading to handle gzipped files efficiently
         import tempfile
-        from dask.dataframe import read_csv
         import pyarrow.parquet as pq
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            print("converting .csv to .parquet to improve the speed of the slicing operations... ", end="")
+            logger.info("Converting transcripts .csv to .parquet to improve the speed of the slicing operations...")
             assert transcripts_file is not None
-            transcripts_data = read_csv(path / transcripts_file, header=0, dtype=_get_tx_dtypes())
-            transcripts_data.to_parquet(Path(tmpdir) / "transcripts.parquet", write_index=False)
-            print("done")
+            
+            # Read transcripts file in chunks using pandas (handles gzip efficiently)
+            # Filter by FOV as we read to reduce memory usage
+            parquet_path = Path(tmpdir) / "transcripts.parquet"
+            chunk_size = 100000  # Process 100k rows at a time
+            fovs_counts_int = set(int(fov) for fov in fovs_counts)  # Convert to int for filtering
+            
+            transcripts_reader = pd.read_csv(
+                path / transcripts_file,
+                header=0,
+                dtype=_get_tx_dtypes(),
+                chunksize=chunk_size,
+            )
+            
+            # Collect filtered chunks (much smaller after filtering by FOV)
+            filtered_chunks = []
+            for chunk_df in transcripts_reader:
+                # Filter to only FOVs we care about
+                chunk_filtered = chunk_df[chunk_df[CosmxKeys.FOV].isin(fovs_counts_int)]
+                if len(chunk_filtered) > 0:
+                    filtered_chunks.append(chunk_filtered)
+            
+            # Combine filtered chunks and write to parquet once
+            if filtered_chunks:
+                transcripts_filtered = pd.concat(filtered_chunks, ignore_index=True)
+                transcripts_filtered.to_parquet(
+                    parquet_path,
+                    engine="pyarrow",
+                    compression="snappy",
+                    index=False,
+                )
+                del transcripts_filtered, filtered_chunks  # Free memory
+                logger.info("done")
 
-            ptable = pq.read_table(Path(tmpdir) / "transcripts.parquet")
-            for fov in fovs_counts:
-                aff = affine_transforms_to_global[fov]
-                sub_table = ptable.filter(pa.compute.equal(ptable.column(CosmxKeys.FOV), int(fov))).to_pandas()
-                sub_table[CosmxKeys.INSTANCE_KEY] = sub_table[CosmxKeys.INSTANCE_KEY].astype("category")
-                # we rename z because we want to treat the data as 2d
-                sub_table.rename(columns={"z": "z_raw"}, inplace=True)
-                if "CellComp" in sub_table:
-                    sub_table['CellComp'] = sub_table['CellComp'].fillna('0').astype("category")
+                ptable = pq.read_table(parquet_path)
+            else:
+                logger.warning("No transcripts found for the specified FOVs.")
+                ptable = None
+            
+            if ptable is not None:
+                for fov in fovs_counts:
+                    aff = affine_transforms_to_global[fov]
+                    sub_table = ptable.filter(pa.compute.equal(ptable.column(CosmxKeys.FOV), int(fov))).to_pandas()
+                    sub_table[CosmxKeys.INSTANCE_KEY] = sub_table[CosmxKeys.INSTANCE_KEY].astype("category")
+                    # we rename z because we want to treat the data as 2d
+                    sub_table.rename(columns={"z": "z_raw"}, inplace=True)
+                    if "CellComp" in sub_table:
+                        sub_table['CellComp'] = sub_table['CellComp'].fillna('0').astype("category")
 
-                if len(sub_table) > 0:
-                    points[f"{fov}_points"] = PointsModel.parse(
-                        sub_table,
-                        coordinates={"x": CosmxKeys.X_LOCAL_TRANSCRIPT, "y": CosmxKeys.Y_LOCAL_TRANSCRIPT},
-                        feature_key=CosmxKeys.TARGET_OF_TRANSCRIPT,
-                        instance_key=CosmxKeys.INSTANCE_KEY,
-                        transformations={
-                            fov: Identity(),
-                            "global": aff,
-                            "global_only_labels": aff,
-                        },
-                    )
+                    if len(sub_table) > 0:
+                        points[f"{fov}_points"] = PointsModel.parse(
+                            sub_table,
+                            coordinates={"x": CosmxKeys.X_LOCAL_TRANSCRIPT, "y": CosmxKeys.Y_LOCAL_TRANSCRIPT},
+                            feature_key=CosmxKeys.TARGET_OF_TRANSCRIPT,
+                            instance_key=CosmxKeys.INSTANCE_KEY,
+                            transformations={
+                                fov: Identity(),
+                                "global": aff,
+                                "global_only_labels": aff,
+                            },
+                        )
 
     # TODO: what to do with fov file?
     # if fov_file is not None:
