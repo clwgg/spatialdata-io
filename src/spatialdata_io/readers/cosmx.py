@@ -389,10 +389,25 @@ def cosmx(
                 chunksize=chunk_size,
             )
             
+            # Create PyArrow schema from _get_tx_dtypes() to ensure consistency
+            # Convert pandas dtypes to PyArrow types, making string columns nullable
+            tx_dtypes = _get_tx_dtypes()
+            schema_fields = []
+            for col_name, dtype in tx_dtypes.items():
+                if dtype == 'int64':
+                    schema_fields.append(pa.field(col_name, pa.int64(), nullable=False))
+                elif dtype == 'float64':
+                    schema_fields.append(pa.field(col_name, pa.float64(), nullable=False))
+                elif dtype == 'O':  # object/string
+                    schema_fields.append(pa.field(col_name, pa.string(), nullable=True))
+                else:
+                    # Fallback: infer from first chunk if dtype not recognized
+                    schema_fields.append(pa.field(col_name, pa.string(), nullable=True))
+            schema = pa.schema(schema_fields)
+            
             # Write filtered chunks directly to parquet incrementally
             # This avoids loading all filtered data into memory at once
             parquet_writer = None
-            first_chunk = True
             total_rows_written = 0
             
             for chunk_df in transcripts_reader:
@@ -400,17 +415,17 @@ def cosmx(
                 chunk_filtered = chunk_df[chunk_df[CosmxKeys.FOV].isin(fovs_counts_int)]
                 
                 if len(chunk_filtered) > 0:
-                    # Convert to PyArrow table
-                    pa_table = pa.Table.from_pandas(chunk_filtered, preserve_index=False)
-                    
-                    if first_chunk:
-                        # Initialize parquet writer with schema from first chunk
+                    # Initialize writer on first matching chunk
+                    if parquet_writer is None:
                         parquet_writer = pq.ParquetWriter(
                             parquet_path,
-                            pa_table.schema,
+                            schema,
                             compression='snappy',
                         )
-                        first_chunk = False
+                    
+                    # Convert to PyArrow table and cast to consistent schema
+                    pa_table = pa.Table.from_pandas(chunk_filtered, preserve_index=False)
+                    pa_table = pa_table.cast(schema)
                     
                     # Write chunk directly to parquet
                     parquet_writer.write_table(pa_table)
