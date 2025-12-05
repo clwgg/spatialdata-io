@@ -291,6 +291,7 @@ def cosmx(
             + "... will use only fovs in Table."
         )
 
+    logger.info("Reading images...")
 
     channels = [c.replace("Max.", "") for c in
                 table.obs.columns[table.obs.columns.str.startswith("Max.")]]
@@ -338,6 +339,7 @@ def cosmx(
                 logger.warning(f"FOV {fov} not found in counts file. Skipping image {fname}.")
 
     # read labels
+    logger.info("Reading labels...")
     labels = {}
     for fname in os.listdir(path / CosmxKeys.LABELS_DIR):
         if fname.endswith(file_extensions):
@@ -375,7 +377,7 @@ def cosmx(
             assert transcripts_file is not None
             
             # Read transcripts file in chunks using pandas (handles gzip efficiently)
-            # Filter by FOV as we read to reduce memory usage
+            # Filter by FOV and write to parquet incrementally to avoid loading all data into memory
             parquet_path = Path(tmpdir) / "transcripts.parquet"
             chunk_size = 100000  # Process 100k rows at a time
             fovs_counts_int = set(int(fov) for fov in fovs_counts)  # Convert to int for filtering
@@ -387,26 +389,38 @@ def cosmx(
                 chunksize=chunk_size,
             )
             
-            # Collect filtered chunks (much smaller after filtering by FOV)
-            filtered_chunks = []
+            # Write filtered chunks directly to parquet incrementally
+            # This avoids loading all filtered data into memory at once
+            parquet_writer = None
+            first_chunk = True
+            total_rows_written = 0
+            
             for chunk_df in transcripts_reader:
                 # Filter to only FOVs we care about
                 chunk_filtered = chunk_df[chunk_df[CosmxKeys.FOV].isin(fovs_counts_int)]
+                
                 if len(chunk_filtered) > 0:
-                    filtered_chunks.append(chunk_filtered)
+                    # Convert to PyArrow table
+                    pa_table = pa.Table.from_pandas(chunk_filtered, preserve_index=False)
+                    
+                    if first_chunk:
+                        # Initialize parquet writer with schema from first chunk
+                        parquet_writer = pq.ParquetWriter(
+                            parquet_path,
+                            pa_table.schema,
+                            compression='snappy',
+                        )
+                        first_chunk = False
+                    
+                    # Write chunk directly to parquet
+                    parquet_writer.write_table(pa_table)
+                    total_rows_written += len(chunk_filtered)
+                    del chunk_filtered, pa_table  # Free memory immediately
             
-            # Combine filtered chunks and write to parquet once
-            if filtered_chunks:
-                transcripts_filtered = pd.concat(filtered_chunks, ignore_index=True)
-                transcripts_filtered.to_parquet(
-                    parquet_path,
-                    engine="pyarrow",
-                    compression="snappy",
-                    index=False,
-                )
-                del transcripts_filtered, filtered_chunks  # Free memory
-                logger.info("done")
-
+            # Close parquet writer
+            if parquet_writer is not None:
+                parquet_writer.close()
+                logger.info(f"... done ({total_rows_written:,} rows written)")
                 ptable = pq.read_table(parquet_path)
             else:
                 logger.warning("No transcripts found for the specified FOVs.")
@@ -444,5 +458,7 @@ def cosmx(
     #         except KeyError:
     #             logg.warning(f"FOV `{str(fov)}` does not exist, skipping it.")
     #             continue
+
+    logger.info("Done building SpatialData object.")
 
     return SpatialData(images=images, labels=labels, points=points, table=table)
