@@ -373,12 +373,11 @@ def cosmx(
         import pyarrow.parquet as pq
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            logger.info("Converting transcripts .csv to .parquet to improve the speed of the slicing operations...")
+            logger.info("Converting transcripts .csv to .parquet (one file per FOV) to improve the speed of the slicing operations...")
             assert transcripts_file is not None
             
             # Read transcripts file in chunks using pandas (handles gzip efficiently)
-            # Filter by FOV and write to parquet incrementally to avoid loading all data into memory
-            parquet_path = Path(tmpdir) / "transcripts.parquet"
+            # Filter by FOV and write to separate parquet files (one per FOV) to avoid loading all data
             chunk_size = 100000  # Process 100k rows at a time
             fovs_counts_int = set(int(fov) for fov in fovs_counts)  # Convert to int for filtering
             
@@ -405,9 +404,9 @@ def cosmx(
                     schema_fields.append(pa.field(col_name, pa.string(), nullable=True))
             schema = pa.schema(schema_fields)
             
-            # Write filtered chunks directly to parquet incrementally
-            # This avoids loading all filtered data into memory at once
-            parquet_writer = None
+            # Write filtered chunks directly to parquet files, one per FOV
+            # This avoids loading all data into memory and eliminates the need to re-read and subset
+            parquet_writers = {}  # Dict of FOV -> ParquetWriter
             total_rows_written = 0
             
             for chunk_df in transcripts_reader:
@@ -415,54 +414,65 @@ def cosmx(
                 chunk_filtered = chunk_df[chunk_df[CosmxKeys.FOV].isin(fovs_counts_int)]
                 
                 if len(chunk_filtered) > 0:
-                    # Initialize writer on first matching chunk
-                    if parquet_writer is None:
-                        parquet_writer = pq.ParquetWriter(
-                            parquet_path,
-                            schema,
-                            compression='snappy',
-                        )
+                    # Group by FOV and write each FOV's data to its own parquet file
+                    # This handles chunks that contain multiple FOVs
+                    for fov_int, fov_group in chunk_filtered.groupby(CosmxKeys.FOV):
+                        fov_str = str(fov_int)
+                        
+                        # Initialize writer for this FOV if not already created
+                        if fov_str not in parquet_writers:
+                            fov_parquet_path = Path(tmpdir) / f"transcripts_fov_{fov_str}.parquet"
+                            parquet_writers[fov_str] = pq.ParquetWriter(
+                                fov_parquet_path,
+                                schema,
+                                compression='snappy',
+                            )
+                        
+                        # Convert to PyArrow table and cast to consistent schema
+                        pa_table = pa.Table.from_pandas(fov_group, preserve_index=False)
+                        pa_table = pa_table.cast(schema)
+                        
+                        # Write this FOV's chunk directly to its parquet file
+                        parquet_writers[fov_str].write_table(pa_table)
+                        total_rows_written += len(fov_group)
+                        del pa_table  # Free memory immediately
                     
-                    # Convert to PyArrow table and cast to consistent schema
-                    pa_table = pa.Table.from_pandas(chunk_filtered, preserve_index=False)
-                    pa_table = pa_table.cast(schema)
-                    
-                    # Write chunk directly to parquet
-                    parquet_writer.write_table(pa_table)
-                    total_rows_written += len(chunk_filtered)
-                    del chunk_filtered, pa_table  # Free memory immediately
+                    del chunk_filtered  # Free memory immediately
             
-            # Close parquet writer
-            if parquet_writer is not None:
-                parquet_writer.close()
-                logger.info(f"... done ({total_rows_written:,} rows written)")
-                ptable = pq.read_table(parquet_path)
+            # Close all parquet writers
+            for fov_str, writer in parquet_writers.items():
+                writer.close()
+            
+            if parquet_writers:
+                logger.info(f"... done ({total_rows_written:,} rows written across {len(parquet_writers)} FOVs)")
+                
+                # Read each FOV's parquet file and process directly (no need to filter)
+                for fov in fovs_counts:
+                    fov_parquet_path = Path(tmpdir) / f"transcripts_fov_{fov}.parquet"
+                    if fov_parquet_path.exists():
+                        aff = affine_transforms_to_global[fov]
+                        # Read the FOV-specific parquet file directly (already filtered)
+                        sub_table = pq.read_table(fov_parquet_path).to_pandas()
+                        sub_table[CosmxKeys.INSTANCE_KEY] = sub_table[CosmxKeys.INSTANCE_KEY].astype("category")
+                        # we rename z because we want to treat the data as 2d
+                        sub_table.rename(columns={"z": "z_raw"}, inplace=True)
+                        if "CellComp" in sub_table:
+                            sub_table['CellComp'] = sub_table['CellComp'].fillna('0').astype("category")
+
+                        if len(sub_table) > 0:
+                            points[f"{fov}_points"] = PointsModel.parse(
+                                sub_table,
+                                coordinates={"x": CosmxKeys.X_LOCAL_TRANSCRIPT, "y": CosmxKeys.Y_LOCAL_TRANSCRIPT},
+                                feature_key=CosmxKeys.TARGET_OF_TRANSCRIPT,
+                                instance_key=CosmxKeys.INSTANCE_KEY,
+                                transformations={
+                                    fov: Identity(),
+                                    "global": aff,
+                                    "global_only_labels": aff,
+                                },
+                            )
             else:
                 logger.warning("No transcripts found for the specified FOVs.")
-                ptable = None
-            
-            if ptable is not None:
-                for fov in fovs_counts:
-                    aff = affine_transforms_to_global[fov]
-                    sub_table = ptable.filter(pa.compute.equal(ptable.column(CosmxKeys.FOV), int(fov))).to_pandas()
-                    sub_table[CosmxKeys.INSTANCE_KEY] = sub_table[CosmxKeys.INSTANCE_KEY].astype("category")
-                    # we rename z because we want to treat the data as 2d
-                    sub_table.rename(columns={"z": "z_raw"}, inplace=True)
-                    if "CellComp" in sub_table:
-                        sub_table['CellComp'] = sub_table['CellComp'].fillna('0').astype("category")
-
-                    if len(sub_table) > 0:
-                        points[f"{fov}_points"] = PointsModel.parse(
-                            sub_table,
-                            coordinates={"x": CosmxKeys.X_LOCAL_TRANSCRIPT, "y": CosmxKeys.Y_LOCAL_TRANSCRIPT},
-                            feature_key=CosmxKeys.TARGET_OF_TRANSCRIPT,
-                            instance_key=CosmxKeys.INSTANCE_KEY,
-                            transformations={
-                                fov: Identity(),
-                                "global": aff,
-                                "global_only_labels": aff,
-                            },
-                        )
 
     # TODO: what to do with fov file?
     # if fov_file is not None:
