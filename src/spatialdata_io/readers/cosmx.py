@@ -230,16 +230,16 @@ def cosmx(
     channels = [re.sub("^Membrane.*$", "Membrane", c) for c in channels]
     original_channels = channels.copy()
     if len(channels) < 5:
-        raise ValueError(f"Need at least 5 channels. Found only {len(channels)}: {channels}")
+        raise ValueError(f"Need names for at least 5 channels. Found only {len(channels)}: {channels}")
     elif len(channels) > 5:
         logger.warning(
-            f"(TRUNCATED) More than 5 channels detected; truncating channels from {original_channels} "
+            f"(TRUNCATED) More than 5 channel names detected; truncating channel names from {original_channels} "
             f"to {channels[:5]}."
         )
         channels = channels[:5]
     else:
-        logger.warning(
-            f"Found exactly 5 channels: {channels}"
+        logger.info(
+            f"Found exactly 5 channel names: {channels}"
         )
 
     # read images
