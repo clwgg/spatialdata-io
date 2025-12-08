@@ -153,7 +153,8 @@ def cosmx(
 
     # Drop the `cell_id` column because it throws an error given the presence of the `cell_ID` column.
     # Also: `cell_id` is redundant with `cell`
-    obs.drop(columns="cell_id", inplace=True)
+    if "cell_id" in obs.columns:
+        obs.drop(columns="cell_id", inplace=True)
 
     # Read only index and FOV columns to build counts index without loading full data
     # This is memory-efficient for large files
@@ -181,13 +182,13 @@ def cosmx(
     # This avoids loading the entire dense DataFrame into memory
     logger.info(f"Reading counts data in chunks (found {len(common_index)} common cells)...")
     chunk_size = 50000  # Process 50k rows at a time
-    
+
     # Create a mapping from modified index to position in common_index for proper ordering
     common_index_map = {idx: i for i, idx in enumerate(common_index)}
-    
+
     # Store sparse data with their target positions
     sparse_data_list = []  # List of (sparse_matrix, position_array)
-    
+
     # Read in chunks using pandas chunked reading
     counts_reader = pd.read_csv(
         path / counts_file,
@@ -195,7 +196,7 @@ def cosmx(
         index_col=CosmxKeys.INSTANCE_KEY,
         chunksize=chunk_size,
     )
-    
+
     for chunk_df in counts_reader:
         # Modify index same way as before
         chunk_df.index = chunk_df.index.astype(str).str.cat(
@@ -218,7 +219,7 @@ def cosmx(
         # Combine all sparse matrices
         all_sparse = sparse_vstack([data[0] for data in sparse_data_list], format="csr")
         all_positions = np.concatenate([data[1] for data in sparse_data_list])
-        
+
         # Reorder to match common_index order
         reorder_idx = np.argsort(all_positions)
         counts_sparse = all_sparse[reorder_idx]
@@ -375,24 +376,38 @@ def cosmx(
         with tempfile.TemporaryDirectory() as tmpdir:
             logger.info("Converting transcripts .csv to .parquet (one file per FOV) to improve the speed of the slicing operations...")
             assert transcripts_file is not None
-            
+
             # Read transcripts file in chunks using pandas (handles gzip efficiently)
             # Filter by FOV and write to separate parquet files (one per FOV) to avoid loading all data
             chunk_size = 100000  # Process 100k rows at a time
             fovs_counts_int = set(int(fov) for fov in fovs_counts)  # Convert to int for filtering
-            
+
+            # First, read just the header to detect which columns are actually present
+            # This handles cases where some files have 'cell' column and others don't
+            transcripts_header = pd.read_csv(path / transcripts_file, header=0, nrows=0)
+            available_columns = list(transcripts_header.columns)
+
+            # Get the expected dtypes, but only for columns that actually exist
+            tx_dtypes_full = _get_tx_dtypes()
+            tx_dtypes = {col: tx_dtypes_full[col] for col in available_columns if col in tx_dtypes_full}
+
             transcripts_reader = pd.read_csv(
                 path / transcripts_file,
                 header=0,
-                dtype=_get_tx_dtypes(),
+                dtype=tx_dtypes,
                 chunksize=chunk_size,
             )
-            
-            # Create PyArrow schema from _get_tx_dtypes() to ensure consistency
+
+            # Create PyArrow schema from available columns only
             # Convert pandas dtypes to PyArrow types, making string columns nullable
-            tx_dtypes = _get_tx_dtypes()
             schema_fields = []
-            for col_name, dtype in tx_dtypes.items():
+            for col_name in available_columns:
+                if col_name in tx_dtypes:
+                    dtype = tx_dtypes[col_name]
+                else:
+                    # If column not in expected dtypes, infer as string
+                    dtype = 'O'
+
                 if dtype == 'int64':
                     schema_fields.append(pa.field(col_name, pa.int64(), nullable=False))
                 elif dtype == 'float64':
@@ -400,25 +415,25 @@ def cosmx(
                 elif dtype == 'O':  # object/string
                     schema_fields.append(pa.field(col_name, pa.string(), nullable=True))
                 else:
-                    # Fallback: infer from first chunk if dtype not recognized
+                    # Fallback: infer as string if dtype not recognized
                     schema_fields.append(pa.field(col_name, pa.string(), nullable=True))
             schema = pa.schema(schema_fields)
-            
+
             # Write filtered chunks directly to parquet files, one per FOV
             # This avoids loading all data into memory and eliminates the need to re-read and subset
             parquet_writers = {}  # Dict of FOV -> ParquetWriter
             total_rows_written = 0
-            
+
             for chunk_df in transcripts_reader:
                 # Filter to only FOVs we care about
                 chunk_filtered = chunk_df[chunk_df[CosmxKeys.FOV].isin(fovs_counts_int)]
-                
+
                 if len(chunk_filtered) > 0:
                     # Group by FOV and write each FOV's data to its own parquet file
                     # This handles chunks that contain multiple FOVs
                     for fov_int, fov_group in chunk_filtered.groupby(CosmxKeys.FOV):
                         fov_str = str(fov_int)
-                        
+
                         # Initialize writer for this FOV if not already created
                         if fov_str not in parquet_writers:
                             fov_parquet_path = Path(tmpdir) / f"transcripts_fov_{fov_str}.parquet"
@@ -427,25 +442,27 @@ def cosmx(
                                 schema,
                                 compression='snappy',
                             )
-                        
+
                         # Convert to PyArrow table and cast to consistent schema
-                        pa_table = pa.Table.from_pandas(fov_group, preserve_index=False)
+                        # Ensure columns are in the same order as schema
+                        fov_group_reordered = fov_group[[col for col in available_columns if col in fov_group.columns]]
+                        pa_table = pa.Table.from_pandas(fov_group_reordered, preserve_index=False)
                         pa_table = pa_table.cast(schema)
-                        
+
                         # Write this FOV's chunk directly to its parquet file
                         parquet_writers[fov_str].write_table(pa_table)
                         total_rows_written += len(fov_group)
                         del pa_table  # Free memory immediately
-                    
+
                     del chunk_filtered  # Free memory immediately
-            
+
             # Close all parquet writers
             for fov_str, writer in parquet_writers.items():
                 writer.close()
-            
+
             if parquet_writers:
                 logger.info(f"... done ({total_rows_written:,} rows written across {len(parquet_writers)} FOVs)")
-                
+
                 # Read each FOV's parquet file and process directly (no need to filter)
                 for fov in fovs_counts:
                     fov_parquet_path = Path(tmpdir) / f"transcripts_fov_{fov}.parquet"
