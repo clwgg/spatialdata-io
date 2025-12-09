@@ -11,6 +11,7 @@ import dask.array as da
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import tifffile
 from anndata import AnnData
 from dask.dataframe import DataFrame as DaskDataFrame
 from dask_image.imread import imread
@@ -272,18 +273,24 @@ def cosmx(
     file_extensions += tuple(ext.upper() for ext in file_extensions)
     pat = re.compile(r".*_F(\d+)")
 
-    # check if fovs are correct for images and labels
-    fovs_images = []
+    # List all image files once (unfiltered for checking)
+    all_fov_images = {}  # fov -> filename mapping (all images)
     for fname in os.listdir(path / CosmxKeys.IMAGES_DIR):
         if fname.endswith(file_extensions):
-            fovs_images.append(str(int(pat.findall(fname)[0])))
+            fov = str(int(pat.findall(fname)[0]))
+            all_fov_images[fov] = fname
 
-    fovs_labels = []
+    # List all label files once (unfiltered for checking)
+    all_fov_labels = {}  # fov -> filename mapping (all labels)
     for fname in os.listdir(path / CosmxKeys.LABELS_DIR):
         if fname.endswith(file_extensions):
-            fovs_labels.append(str(int(pat.findall(fname)[0])))
+            fov = str(int(pat.findall(fname)[0]))
+            all_fov_labels[fov] = fname
 
-    fovs_images_and_labels = set(fovs_images).intersection(set(fovs_labels))
+    # Check if fovs are correct for images and labels
+    fovs_images = set(all_fov_images.keys())
+    fovs_labels = set(all_fov_labels.keys())
+    fovs_images_and_labels = fovs_images.intersection(fovs_labels)
     fovs_diff = fovs_images_and_labels.difference(set(fovs_counts))
     if len(fovs_diff):
         logger.warning(
@@ -292,79 +299,94 @@ def cosmx(
             + "... will use only fovs in Table."
         )
 
+    # Filter to only FOVs in counts for actual use
+    fov_images = {fov: fname for fov, fname in all_fov_images.items() if fov in fovs_counts}
+    fov_labels = {fov: fname for fov, fname in all_fov_labels.items() if fov in fovs_counts}
+
     logger.info("Reading images...")
 
-    channels = [c.replace("Max.", "") for c in
-                table.obs.columns[table.obs.columns.str.startswith("Max.")]]
-    channels = [re.sub("^Membrane.*$", "Membrane", c) for c in channels]
-    original_channels = channels.copy()
-    if len(channels) < 5:
-        raise ValueError(f"Need names for at least 5 channels. Found only {len(channels)}: {channels}")
-    elif len(channels) > 5:
-        logger.warning(
-            f"(TRUNCATED) More than 5 channel names detected; truncating channel names from {original_channels} "
-            f"to {channels[:5]}."
-        )
-        channels = channels[:5]
-    else:
-        logger.info(
-            f"Found exactly 5 channel names: {channels}"
-        )
+    # Extract channel names from the first image file using tifffile
+    channels = None
+    if fov_images:
+        first_fov = next(iter(fov_images.keys()))
+        first_image_file = fov_images[first_fov]
+        fpath = path / CosmxKeys.IMAGES_DIR / first_image_file
+        try:
+            with tifffile.TiffFile(fpath) as tif:
+                description = tif.pages[0].description
 
-    # read images
+                substrings = re.findall(r'"BiologicalTarget": "(.*?)",', description)
+                channel_ids = re.findall(r'"ChannelId": "(.*?)",', description)
+                channel_order_match = re.findall(r'"ChannelOrder": "(.*?)",', description)
+
+                if substrings and channel_ids and channel_order_match:
+                    channel_order = list(channel_order_match[0])
+                    channels = [substrings[channel_ids.index(x)] if x in channel_ids else x for x in channel_order]
+                    channels = [channel.replace("/", ".") for channel in channels]
+        except (AttributeError, IndexError, KeyError, ValueError) as e:
+            # Metadata not available in tifffile description, will fall back to table.obs.columns
+            logger.debug(f"Could not extract channels from tifffile metadata: {e}")
+
+    # Fallback to table.obs.columns if tifffile extraction failed
+    if channels is None or len(channels) == 0:
+        logger.info("Channel metadata not found in image files, falling back to table.obs.columns extraction...")
+        channels = [c.replace("Max.", "") for c in
+                    table.obs.columns[table.obs.columns.str.startswith("Max.")]]
+        channels = [re.sub("^Membrane.*$", "Membrane", c) for c in channels]
+
+    # Validate that channels were extracted
+    if channels is None or len(channels) == 0:
+        raise ValueError(
+            f"Could not extract channel names from image files in {path / CosmxKeys.IMAGES_DIR} "
+            f"or from table.obs.columns. Please ensure image files are present and contain valid channel metadata, "
+            f"or that table.obs contains columns starting with 'Max.'."
+        )
+    logger.info(f"Extracted {len(channels)} channel names: {channels}")
+
+    # read images using the pre-filtered list
     images = {}
-    for fname in os.listdir(path / CosmxKeys.IMAGES_DIR):
-        if fname.endswith(file_extensions):
-            fov = str(int(pat.findall(fname)[0]))
-            if fov in fovs_counts:
-                aff = affine_transforms_to_global[fov]
-                im = imread(path / CosmxKeys.IMAGES_DIR / fname, **imread_kwargs).squeeze()
-                if flip_y:
-                    matched_im = da.flip(im, axis=1)
-                else:
-                    matched_im = im
-                parsed_im = Image2DModel.parse(
-                    matched_im,
-                    transformations={
-                        fov: Identity(),
-                        "global": aff,
-                        "global_only_image": aff,
-                    },
-                    dims=("c", "y", "x"),
-                    c_coords=channels,
-                    rgb=None,
-                    **image_models_kwargs,
-                )
-                images[f"{fov}_image"] = parsed_im
-            else:
-                logger.warning(f"FOV {fov} not found in counts file. Skipping image {fname}.")
+    for fov, fname in fov_images.items():
+        aff = affine_transforms_to_global[fov]
+        im = imread(path / CosmxKeys.IMAGES_DIR / fname, **imread_kwargs).squeeze()
+        if flip_y:
+            matched_im = da.flip(im, axis=1)
+        else:
+            matched_im = im
+        parsed_im = Image2DModel.parse(
+            matched_im,
+            transformations={
+                fov: Identity(),
+                "global": aff,
+                "global_only_image": aff,
+            },
+            dims=("c", "y", "x"),
+            c_coords=channels,
+            rgb=None,
+            **image_models_kwargs,
+        )
+        images[f"{fov}_image"] = parsed_im
 
-    # read labels
+    # read labels using the pre-filtered list
     logger.info("Reading labels...")
     labels = {}
-    for fname in os.listdir(path / CosmxKeys.LABELS_DIR):
-        if fname.endswith(file_extensions):
-            fov = str(int(pat.findall(fname)[0]))
-            if fov in fovs_counts:
-                aff = affine_transforms_to_global[fov]
-                la = imread(path / CosmxKeys.LABELS_DIR / fname, **imread_kwargs).squeeze()
-                if flip_y:
-                    matched_la = da.flip(la, axis=0)
-                else:
-                    matched_la = la
-                parsed_la = Labels2DModel.parse(
-                    matched_la,
-                    transformations={
-                        fov: Identity(),
-                        "global": aff,
-                        "global_only_labels": aff,
-                    },
-                    dims=("y", "x"),
-                    **image_models_kwargs,
-                )
-                labels[f"{fov}_labels"] = parsed_la
-            else:
-                logger.warning(f"FOV {fov} not found in counts file. Skipping labels {fname}.")
+    for fov, fname in fov_labels.items():
+        aff = affine_transforms_to_global[fov]
+        la = imread(path / CosmxKeys.LABELS_DIR / fname, **imread_kwargs).squeeze()
+        if flip_y:
+            matched_la = da.flip(la, axis=0)
+        else:
+            matched_la = la
+        parsed_la = Labels2DModel.parse(
+            matched_la,
+            transformations={
+                fov: Identity(),
+                "global": aff,
+                "global_only_labels": aff,
+            },
+            dims=("y", "x"),
+            **image_models_kwargs,
+        )
+        labels[f"{fov}_labels"] = parsed_la
 
     points: dict[str, DaskDataFrame] = {}
     if transcripts:
