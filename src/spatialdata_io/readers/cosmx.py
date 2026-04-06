@@ -228,9 +228,14 @@ def cosmx(
         # Edge case: no matching rows
         counts_sparse = csr_matrix((len(common_index), len(counts_columns)))
 
+    obs_subset = obs.loc[common_index, :].copy()
+    # Fill NaN in string/object columns to avoid zarr VLenUTF8 encoding errors
+    for col in obs_subset.select_dtypes(include="object").columns:
+        obs_subset[col] = obs_subset[col].fillna("").astype(str)
+
     adata = AnnData(
         counts_sparse,
-        obs=obs.loc[common_index, :],
+        obs=obs_subset,
     )
     adata.var_names = counts_columns
 
